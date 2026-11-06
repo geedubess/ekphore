@@ -10,10 +10,7 @@
 #include <cctype>
 #include <exception>
 #include <fstream>
-#include <iterator>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <string_view>
 
 #ifdef __APPLE__
