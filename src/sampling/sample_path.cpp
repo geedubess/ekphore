@@ -10,7 +10,10 @@
 #include <cctype>
 #include <exception>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string_view>
 
 #ifdef __APPLE__
@@ -19,6 +22,33 @@
 #endif
 
 namespace ekphore::sampling {
+namespace {
+std::filesystem::path with_extension_case_variants(
+        const std::filesystem::path &path) {
+    const auto extension = path.extension().string();
+    if (extension.empty())
+        return path;
+    auto lower = extension;
+    auto upper = extension;
+    std::ranges::transform(lower, lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::ranges::transform(upper, upper.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    if (lower == upper)
+        return path;
+    const auto stem = path.stem().string();
+    std::filesystem::path result = path;
+    result.replace_extension(std::filesystem::path(lower));
+    if (std::filesystem::exists(result))
+        return result;
+    result.replace_extension(std::filesystem::path(upper));
+    if (std::filesystem::exists(result))
+        return result;
+    return path;
+}
+} // namespace
 
 libnki::ResolvedPathInfo resolve_sample_path(const libnki::SampleInfo &sample,
         const SamplePathResolutionContext &context) {
@@ -59,101 +89,6 @@ libnki::ResolvedPathInfo resolve_sample_path(const libnki::SampleInfo &sample,
     }
     if (sample.serialized_path)
         return libnki::resolve_path(*sample.serialized_path, paths);
-
-    // Older K2 file_ex2 paths can encode a monolith reference directly:
-    // @bb dNNN<directory> mNNN<container> dNNN<inner-dir> ... F<digits><file>
-    // Decode the container and inner path separately so the normal monolith
-    // loader can find the sample entry.
-    if (sample.path && sample.path->starts_with("@bb")) {
-        const std::string_view encoded(*sample.path);
-        std::size_t cursor = 3;
-        std::vector<std::string> outer_directories;
-        std::vector<std::string> inner_directories;
-        std::optional<std::string> container_name;
-        std::optional<std::string> sample_name;
-        bool valid = true;
-
-        const auto read_named_component = [&](char marker)
-                -> std::optional<std::string> {
-            if (cursor >= encoded.size() || encoded[cursor++] != marker ||
-                    encoded.size() - cursor < 3)
-                return std::nullopt;
-            std::size_t length = 0;
-            for (int digit = 0; digit < 3; ++digit) {
-                const char value = encoded[cursor++];
-                if (value < '0' || value > '9')
-                    return std::nullopt;
-                length = length * 10 +
-                         static_cast<std::size_t>(value - '0');
-            }
-            if (length == 0 || length > encoded.size() - cursor)
-                return std::nullopt;
-            std::string result(encoded.substr(cursor, length));
-            cursor += length;
-            return result;
-        };
-
-        while (valid && cursor < encoded.size()) {
-            const char marker = encoded[cursor];
-            if (marker == 'd') {
-                auto component = read_named_component('d');
-                if (!component) {
-                    valid = false;
-                    break;
-                }
-                (container_name ? inner_directories : outer_directories)
-                        .push_back(std::move(*component));
-            } else if (marker == 'm' && !container_name) {
-                container_name = read_named_component('m');
-                valid = container_name.has_value();
-            } else if (marker == 'F' && container_name) {
-                ++cursor;
-                const auto digits_begin = cursor;
-                while (cursor < encoded.size() && encoded[cursor] >= '0' &&
-                        encoded[cursor] <= '9')
-                    ++cursor;
-                if (cursor == digits_begin || cursor == encoded.size()) {
-                    valid = false;
-                    break;
-                }
-                sample_name = std::string(encoded.substr(cursor));
-                cursor = encoded.size();
-            } else {
-                valid = false;
-            }
-            if (sample_name)
-                break;
-        }
-
-        if (valid && container_name && sample_name && cursor == encoded.size() &&
-                paths.content_directory && !paths.content_directory->empty()) {
-            auto container_path = *paths.content_directory;
-            for (const auto &directory : outer_directories)
-                container_path /= directory;
-            container_path /= *container_name;
-
-            libnki::ResolvedPathInfo resolved;
-            resolved.status = libnki::PathResolutionStatus::container_or_device;
-            libnki::ContainerOrDevicePathInfo special;
-            special.marker_kind = 8;
-            special.enclosing_status = libnki::PathResolutionStatus::resolved;
-            special.resolved_enclosing_path = container_path.lexically_normal();
-            special.inner_path.resolution_base =
-                    libnki::PathResolutionBase::container_inner;
-            for (const auto &directory : inner_directories) {
-                special.inner_path.segments.push_back(
-                        { 4, 4, libnki::SerializedPathPayloadKind::text,
-                                directory, std::nullopt });
-            }
-            special.inner_path.segments.push_back(
-                    { 4, 4, libnki::SerializedPathPayloadKind::text,
-                            *sample_name, std::nullopt });
-            resolved.path = special.resolved_enclosing_path;
-            resolved.container_or_device = std::move(special);
-            return resolved;
-        }
-    }
-
     libnki::ResolvedPathInfo resolved;
     if (!sample.path || sample.path->empty())
         return resolved;
@@ -166,8 +101,10 @@ libnki::ResolvedPathInfo resolve_sample_path(const libnki::SampleInfo &sample,
         }
         path = *paths.read_context / path;
     }
+    path = path.lexically_normal();
+    const auto variant = with_extension_case_variants(path);
     resolved.status = libnki::PathResolutionStatus::resolved;
-    resolved.path = path.lexically_normal();
+    resolved.path = variant;
     return resolved;
 }
 
@@ -563,25 +500,6 @@ SamplePathResolutionContext make_sample_path_resolution_context(
         const std::filesystem::path &instrument_path) {
     SamplePathResolutionContext context;
     context.paths.read_context = instrument_path.parent_path();
-
-    // A conventional library has Instruments/ and Samples/ at its root.
-    // Use this as a fallback when no nearby NICNT provides the library root.
-    for (auto root = instrument_path.parent_path(); !root.empty();) {
-        std::error_code error;
-        if (std::filesystem::is_directory(root / "Instruments", error) &&
-                !error &&
-                std::filesystem::is_directory(root / "Samples", error) &&
-                !error) {
-            context.default_sample_base = root;
-            context.paths.content_directory = root;
-            break;
-        }
-        const auto parent = root.parent_path();
-        if (parent == root)
-            break;
-        root = parent;
-    }
-
     auto libraries =
             std::make_shared<const std::vector<libnki::LocalLibraryInfo>>(
                     libnki::discover_local_libraries(instrument_path));
