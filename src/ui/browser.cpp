@@ -27,6 +27,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <set>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -829,11 +830,30 @@ Catalog scan(const fs::path &folder, std::stop_token stop,
     std::map<std::string, fs::path> roots;
     std::map<fs::path, bool> key_availability;
     bool provision_checked = false;
-    fs::recursive_directory_iterator it(
-            folder, fs::directory_options::skip_permission_denied, error),
+    std::set<fs::path> visited_directories;
+    const auto canonical_folder = fs::weakly_canonical(folder, error);
+    if (!error)
+        visited_directories.insert(canonical_folder);
+    error.clear();
+
+    fs::recursive_directory_iterator it(folder,
+            fs::directory_options::skip_permission_denied |
+                    fs::directory_options::follow_directory_symlink,
+            error),
             end;
+
     while (it != end && !stop.stop_requested()) {
         const auto path = it->path();
+
+        if (it->is_directory(error)) {
+            const auto canonical = fs::weakly_canonical(path, error);
+            if (error || !visited_directories.insert(canonical).second)
+                it.disable_recursion_pending();
+            error.clear();
+        } else if (error) {
+            error.clear();
+        }
+
         const auto ext = lower(utf8(path.extension()));
         if ((ext == ".nki" || ext == ".nksn") && it->is_regular_file(error)) {
             bool encrypted = false;
