@@ -471,6 +471,25 @@ SamplePathResolutionContext make_sample_path_resolution_context(
         const std::filesystem::path &instrument_path) {
     SamplePathResolutionContext context;
     context.paths.read_context = instrument_path.parent_path();
+
+    // A conventional library has Instruments/ and Samples/ at its root.
+    // Use this as a fallback when no nearby NICNT provides the library root.
+    for (auto root = instrument_path.parent_path(); !root.empty();) {
+        std::error_code error;
+        if (std::filesystem::is_directory(root / "Instruments", error) &&
+                !error &&
+                std::filesystem::is_directory(root / "Samples", error) &&
+                !error) {
+            context.default_sample_base = root;
+            context.paths.content_directory = root;
+            break;
+        }
+        const auto parent = root.parent_path();
+        if (parent == root)
+            break;
+        root = parent;
+    }
+
     auto libraries =
             std::make_shared<const std::vector<libnki::LocalLibraryInfo>>(
                     libnki::discover_local_libraries(instrument_path));
