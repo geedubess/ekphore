@@ -62,6 +62,101 @@ libnki::ResolvedPathInfo resolve_sample_path(const libnki::SampleInfo &sample,
     }
     if (sample.serialized_path)
         return libnki::resolve_path(*sample.serialized_path, paths);
+
+    // Older K2 file_ex2 paths can encode a monolith reference directly:
+    // @bb dNNN<directory> mNNN<container> dNNN<inner-dir> ... F<digits><file>
+    // Decode the container and inner path separately so the normal monolith
+    // loader can find the sample entry.
+    if (sample.path && sample.path->starts_with("@bb")) {
+        const std::string_view encoded(*sample.path);
+        std::size_t cursor = 3;
+        std::vector<std::string> outer_directories;
+        std::vector<std::string> inner_directories;
+        std::optional<std::string> container_name;
+        std::optional<std::string> sample_name;
+        bool valid = true;
+
+        const auto read_named_component = [&](char marker)
+                -> std::optional<std::string> {
+            if (cursor >= encoded.size() || encoded[cursor++] != marker ||
+                    encoded.size() - cursor < 3)
+                return std::nullopt;
+            std::size_t length = 0;
+            for (int digit = 0; digit < 3; ++digit) {
+                const char value = encoded[cursor++];
+                if (value < '0' || value > '9')
+                    return std::nullopt;
+                length = length * 10 +
+                         static_cast<std::size_t>(value - '0');
+            }
+            if (length == 0 || length > encoded.size() - cursor)
+                return std::nullopt;
+            std::string result(encoded.substr(cursor, length));
+            cursor += length;
+            return result;
+        };
+
+        while (valid && cursor < encoded.size()) {
+            const char marker = encoded[cursor];
+            if (marker == 'd') {
+                auto component = read_named_component('d');
+                if (!component) {
+                    valid = false;
+                    break;
+                }
+                (container_name ? inner_directories : outer_directories)
+                        .push_back(std::move(*component));
+            } else if (marker == 'm' && !container_name) {
+                container_name = read_named_component('m');
+                valid = container_name.has_value();
+            } else if (marker == 'F' && container_name) {
+                ++cursor;
+                const auto digits_begin = cursor;
+                while (cursor < encoded.size() && encoded[cursor] >= '0' &&
+                        encoded[cursor] <= '9')
+                    ++cursor;
+                if (cursor == digits_begin || cursor == encoded.size()) {
+                    valid = false;
+                    break;
+                }
+                sample_name = std::string(encoded.substr(cursor));
+                cursor = encoded.size();
+            } else {
+                valid = false;
+            }
+            if (sample_name)
+                break;
+        }
+
+        if (valid && container_name && sample_name && cursor == encoded.size() &&
+                paths.content_directory && !paths.content_directory->empty()) {
+            auto container_path = *paths.content_directory;
+            for (const auto &directory : outer_directories)
+                container_path /= directory;
+            container_path /= *container_name;
+
+            libnki::ResolvedPathInfo resolved;
+            resolved.status = libnki::PathResolutionStatus::container_or_device;
+            libnki::ContainerOrDevicePathInfo special;
+            special.marker_kind = 8;
+            special.enclosing_status = libnki::PathResolutionStatus::resolved;
+            special.resolved_enclosing_path = container_path.lexically_normal();
+            special.inner_path.resolution_base =
+                    libnki::PathResolutionBase::container_inner;
+            for (const auto &directory : inner_directories) {
+                special.inner_path.segments.push_back(
+                        { 4, 4, libnki::SerializedPathPayloadKind::text,
+                                directory, std::nullopt });
+            }
+            special.inner_path.segments.push_back(
+                    { 4, 4, libnki::SerializedPathPayloadKind::text,
+                            *sample_name, std::nullopt });
+            resolved.path = special.resolved_enclosing_path;
+            resolved.container_or_device = std::move(special);
+            return resolved;
+        }
+    }
+
     libnki::ResolvedPathInfo resolved;
     if (!sample.path || sample.path->empty())
         return resolved;
