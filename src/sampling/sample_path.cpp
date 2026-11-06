@@ -19,6 +19,33 @@
 #endif
 
 namespace ekphore::sampling {
+namespace {
+std::filesystem::path with_extension_case_variants(
+        const std::filesystem::path &path) {
+    const auto extension = path.extension().string();
+    if (extension.empty())
+        return path;
+    auto lower = extension;
+    auto upper = extension;
+    std::ranges::transform(lower, lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::ranges::transform(upper, upper.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    if (lower == upper)
+        return path;
+    const auto stem = path.stem().string();
+    std::filesystem::path result = path;
+    result.replace_extension(std::filesystem::path(lower));
+    if (std::filesystem::exists(result))
+        return result;
+    result.replace_extension(std::filesystem::path(upper));
+    if (std::filesystem::exists(result))
+        return result;
+    return path;
+}
+} // namespace
 
 libnki::ResolvedPathInfo resolve_sample_path(const libnki::SampleInfo &sample,
         const SamplePathResolutionContext &context) {
@@ -57,8 +84,14 @@ libnki::ResolvedPathInfo resolve_sample_path(const libnki::SampleInfo &sample,
         }
         paths.read_context = root;
     }
-    if (sample.serialized_path)
-        return libnki::resolve_path(*sample.serialized_path, paths);
+
+    if (sample.serialized_path) {
+        auto resolved = libnki::resolve_path(*sample.serialized_path, paths);
+        if (resolved.status == libnki::PathResolutionStatus::resolved &&
+                resolved.path)
+            resolved.path = with_extension_case_variants(*resolved.path);
+        return resolved;
+    }
 
     // Older K2 file_ex2 paths can encode a monolith reference directly:
     // @bb dNNN<directory> mNNN<container> dNNN<inner-dir> ... F<digits><file>
@@ -166,8 +199,10 @@ libnki::ResolvedPathInfo resolve_sample_path(const libnki::SampleInfo &sample,
         }
         path = *paths.read_context / path;
     }
+    path = path.lexically_normal();
+    const auto variant = with_extension_case_variants(path);
     resolved.status = libnki::PathResolutionStatus::resolved;
-    resolved.path = path.lexically_normal();
+    resolved.path = variant;
     return resolved;
 }
 
