@@ -82,12 +82,46 @@ LoadReport Player::load(const std::filesystem::path &requested_path,
 
     const auto sample_path_context =
             sampling::make_sample_path_resolution_context(path);
+    const auto private_key = keys::private_key(path);
+    std::vector<std::byte> product_key;
+    std::vector<std::byte> file_bytes;
     try {
-        state.document = libnki::parse_file(path);
+        MappedFile source(path);
+        const auto bytes = source.bytes();
+        file_bytes.assign(bytes.begin(), bytes.end());
     } catch (const std::exception &error) {
         report.diagnostics.emplace_back(error.what());
         return report;
     }
+
+    // K42 requires a product-specific key at parse time. Derive it from the
+    // private key and nearby NICNT metadata before parsing the document.
+    const auto generation = libnki::detect_patch_generation(file_bytes);
+    try {
+        if (generation == libnki::PatchGeneration::k42 &&
+                libnki::k42_legacy_otp_encrypted(file_bytes)) {
+            product_key = libnki::derive_local_product_encryption_key(
+                    private_key, libnki::discover_local_libraries(path),
+                    libnki::k42_product_id(file_bytes));
+        } else if (generation == libnki::PatchGeneration::k2 &&
+                libnki::k2_legacy_otp_encrypted(file_bytes)) {
+            product_key = libnki::derive_local_product_encryption_key(
+                    private_key, libnki::discover_local_libraries(path),
+                    libnki::k2_product_id(file_bytes));
+        }
+    } catch (const std::exception &error) {
+        report.diagnostics.emplace_back(
+                std::string("Product key: ") + error.what());
+        return report;
+    }
+
+    try {
+        state.document = libnki::parse(file_bytes, product_key);
+    } catch (const std::exception &error) {
+        report.diagnostics.emplace_back(error.what());
+        return report;
+    }
+
     if (!state.document.structurally_valid()) {
         for (const auto &error : state.document.errors)
             report.diagnostics.push_back(error.message);
@@ -97,15 +131,18 @@ LoadReport Player::load(const std::filesystem::path &requested_path,
         return report;
     }
 
-    std::vector<std::byte> product_key;
     libnki::Model model;
     try {
-        model = libnki::parse_model_file_with_private_key(
-                path, keys::private_key(path));
+        if (!product_key.empty())
+            model = libnki::parse_model(file_bytes, product_key);
+        else
+            model = libnki::parse_model_file_with_private_key(
+                    path, private_key);
     } catch (const std::exception &error) {
         report.diagnostics.emplace_back(error.what());
         return report;
     }
+
     // kontakt gets HU/JDX from Native Access, but a copied library has the same
     // record in its NICNT, so look for one nearby before giving up
     if (model.instruments.empty()) {
@@ -196,7 +233,6 @@ LoadReport Player::load(const std::filesystem::path &requested_path,
         }
     }
 
-    const auto private_key = keys::private_key(path);
     if (product_key.empty() && !private_key.empty()) {
         std::string snpid;
         for (const auto &preset : state.document.presets) {
