@@ -97,22 +97,49 @@ LoadReport Player::load(const std::filesystem::path &requested_path,
     // K42 requires a product-specific key at parse time. Derive it from the
     // private key and nearby NICNT metadata before parsing the document.
     const auto generation = libnki::detect_patch_generation(file_bytes);
-    try {
-        if (generation == libnki::PatchGeneration::k42 &&
-                libnki::k42_legacy_otp_encrypted(file_bytes)) {
-            product_key = libnki::derive_local_product_encryption_key(
-                    private_key, libnki::discover_local_libraries(path),
-                    libnki::k42_product_id(file_bytes));
-        } else if (generation == libnki::PatchGeneration::k2 &&
-                libnki::k2_legacy_otp_encrypted(file_bytes)) {
-            product_key = libnki::derive_local_product_encryption_key(
-                    private_key, libnki::discover_local_libraries(path),
-                    libnki::k2_product_id(file_bytes));
+    std::optional<std::uint32_t> product_id;
+    if (generation == libnki::PatchGeneration::k42 &&
+            libnki::k42_legacy_otp_encrypted(file_bytes)) {
+        product_id = libnki::k42_product_id(file_bytes);
+    } else if (generation == libnki::PatchGeneration::k2 &&
+            libnki::k2_legacy_otp_encrypted(file_bytes)) {
+        product_id = libnki::k2_product_id(file_bytes);
+    }
+
+    if (product_id) {
+        try {
+            if (private_key.empty())
+                throw std::runtime_error(
+                        "private key is unavailable; cannot derive product key");
+
+            const auto libraries = libnki::discover_local_libraries(path);
+            try {
+                product_key =
+                        libnki::derive_local_product_encryption_key(
+                                private_key, libraries, *product_id);
+            } catch (const std::exception &local_error) {
+                const auto *hints_path =
+                        std::getenv("EKPHORE_PRODUCT_HINTS_PATH");
+                if (!hints_path || !*hints_path)
+                    throw;
+
+                try {
+                    product_key = libnki::derive_product_encryption_key(
+                            private_key, *product_id,
+                            std::filesystem::u8path(hints_path));
+                } catch (const std::exception &hints_error) {
+                    throw std::runtime_error(
+                            std::string("local NICNT lookup failed (") +
+                            local_error.what() +
+                            "); ProductHints fallback failed (" +
+                            hints_error.what() + ")");
+                }
+            }
+        } catch (const std::exception &error) {
+            report.diagnostics.emplace_back(
+                    std::string("Product key: ") + error.what());
+            return report;
         }
-    } catch (const std::exception &error) {
-        report.diagnostics.emplace_back(
-                std::string("Product key: ") + error.what());
-        return report;
     }
 
     try {
